@@ -26,8 +26,8 @@
 
 ### 4. `notify_overdue`
 
-- **参数**：`hours`（可选，超时阈值小时，默认 8）、`dryRun`（可选，true 只预览不发送）、`only`（可选，只通知指定人，逗号分隔）、`map`（可选，同名时指定目标账号，形如 `姓名=userId或openDingTalkId`，逗号分隔）
-- **返回**：催办结果。把停留超过阈值的流程按处理人分组，逐个发钉钉催办通知。
+- **参数**：`hours`（可选，超时阈值小时，默认 4）、`dryRun`（可选，true 只预览不发送）、`only`（可选，只通知指定人，逗号分隔）、`map`（可选，同名时指定目标账号，形如 `姓名=userId或openDingTalkId`，逗号分隔）
+- **返回**：催办结果。把停留超过阈值的流程按处理人分组，逐个发钉钉催办通知（自动发送，无需确认）。
 - **同名处理**：若某处理人在钉钉通讯录中存在同名（或多个近似匹配），不会擅自选择，而是通过钉钉通知使用者本人，列出候选人（职位/userId）让其判断；使用者用 `map` 指定后重跑即可定向发送。
 - **前置**：需先运行 `query_myflow` 抓取数据。
 
@@ -46,7 +46,7 @@ cd mcp && npm install
   "mcpServers": {
     "kingdee-myflow": {
       "command": "node",
-      "args": ["C:/Users/011387/.workbuddy/skills/kingdee-myflow-report/mcp/server.js"]
+      "args": ["<本仓库路径>/mcp/server.js"]
     }
   }
 }
