@@ -81,9 +81,18 @@ function isUserId(id) {
   return /^\d+$/.test(String(id).trim());
 }
 
-/** 用 openDingTalkId 或 userId 发送单聊，返回 dws 结果 */
+/**
+ * 用 openDingTalkId 或 userId 发送单聊，返回 dws 结果。
+ * 注意：dws 的 chat message send --content 走 Markdown 渲染，单个 \n 会被折叠成空格，
+ * 导致多行明细（流程名/节点/停留时长/流程实例）挤成一行。这里在发送前把每个非空行
+ * 末尾补两个空格（Markdown 强制换行），确保每一行都独立换行显示。
+ */
 function sendChat(target, title, content) {
-  const args = ['chat', 'message', 'send', '--title', title, '--content', content, '--format', 'json'];
+  const text = content
+    .split('\n')
+    .map((line) => (line.trim() ? line.replace(/[ \t]+$/, '') + '  ' : line))
+    .join('\n');
+  const args = ['chat', 'message', 'send', '--title', title, '--content', text, '--format', 'json'];
   if (isUserId(target)) args.push('--user', target);
   else args.push('--open-dingtalk-id', target);
   return dws(args);
