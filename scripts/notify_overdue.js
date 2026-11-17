@@ -83,16 +83,14 @@ function isUserId(id) {
 
 /**
  * 用 openDingTalkId 或 userId 发送单聊，返回 dws 结果。
- * 注意：dws 的 chat message send --content 走 Markdown 渲染，单个 \n 会被折叠成空格，
- * 导致多行明细（流程名/节点/停留时长/流程实例）挤成一行。这里在发送前把每个非空行
- * 末尾补两个空格（Markdown 强制换行），确保每一行都独立换行显示。
+ * 兼容性说明：dws 的 chat message send 走 Markdown 通道，换行最终被规范化为
+ * Markdown 硬换行（行尾双空格），旧版钉钉客户端（如 7.0）对其渲染不佳会导致换行
+ * 错乱。因此催办正文的每条流程信息已改为「单行 + ｜ 分隔」的结构（见 main 中
+ * content 构建），即使换行失效，流程编号/节点/停留时长/实例也完整可读。
+ * 这里对 content 不再做额外的换行转换，直接原样传递。
  */
 function sendChat(target, title, content) {
-  const text = content
-    .split('\n')
-    .map((line) => (line.trim() ? line.replace(/[ \t]+$/, '') + '  ' : line))
-    .join('\n');
-  const args = ['chat', 'message', 'send', '--title', title, '--content', text, '--format', 'json'];
+  const args = ['chat', 'message', 'send', '--title', title, '--content', content, '--format', 'json'];
   if (isUserId(target)) args.push('--user', target);
   else args.push('--open-dingtalk-id', target);
   return dws(args);
@@ -199,9 +197,10 @@ function main() {
     lines.push('您好 ' + p.name + '，以下流程停留已超过 ' + hours + ' 小时，请尽快处理：');
     lines.push('');
     p.nodes.forEach((n, i) => {
-      lines.push((i + 1) + '. ' + n.flow);
-      lines.push('   节点：' + n.node + '｜停留：' + fmtDuration(n.stayedMs));
-      lines.push('   流程实例：' + n.instance);
+      // 每条流程合并成一行，字段用 ｜ 分隔：即使旧版客户端换行渲染失效，信息也完整可读。
+      // 编号用【N】避免被 Markdown 有序列表语法劫持（1. 2. 会被自动重编号）。
+      lines.push('【' + (i + 1) + '】' + n.flow + '｜节点：' + n.node + '｜停留：' + fmtDuration(n.stayedMs) + '｜实例：' + n.instance);
+      if (i < p.nodes.length - 1) lines.push(''); // 多条流程之间留空行，避免换行折叠后粘连
     });
     lines.push('');
     lines.push('请登录金蝶云星空及时处理，谢谢！');
