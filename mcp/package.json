@@ -1,0 +1,14 @@
+{
+  "name": "kingdee-myflow-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "description": "金蝶云星空「我的流程」MCP Server：查询当前处理人与停留时长，并经钉钉发送报告",
+  "main": "server.js",
+  "bin": {
+    "kingdee-myflow-mcp": "server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.9.0"
+  }
+}

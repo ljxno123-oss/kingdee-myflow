@@ -1,0 +1,9 @@
+{
+  "name": "kingdee-myflow-report-scripts",
+  "private": true,
+  "version": "1.0.0",
+  "description": "金蝶云星空我的流程抓取脚本依赖",
+  "dependencies": {
+    "playwright-core": "^1.40.0"
+  }
+}

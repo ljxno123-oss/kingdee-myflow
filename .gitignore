@@ -1,0 +1,20 @@
+# 依赖
+node_modules/
+**/node_modules/
+
+# 敏感凭据（用户名/密码、钉钉账号）
+scripts/credentials.json
+scripts/config.json
+mcp/credentials.json
+mcp/config.json
+
+# 运行产物（验证码截图、流程数据、报告）
+scripts/captcha.*
+scripts/flow_*.json
+scripts/flow_report.txt
+scripts/no_grid.png
+scripts/*.png
+
+# 系统文件
+.DS_Store
+Thumbs.db

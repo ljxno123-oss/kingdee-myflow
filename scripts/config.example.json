@@ -1,0 +1,10 @@
+{
+  "url": "http://i.enpower.com:8600/k3cloud/html5/index.aspx",
+  "datacenter": "珠海英搏尔",
+  "headless": true,
+  "captchaTimeoutSec": 360,
+  "useLocalOcr": true,
+  "overdueHours": 4,
+  "dingtalkOpenId": "可选：只想发给别人时填 openDingTalkId（dws contact user search --keyword 姓名 里返回）。不填则自动发给当前登录用户本人",
+  "dingtalkUserId": "可选：或填 userId（dws profile list 里返回）。不填则自动发给当前登录用户本人"
+}

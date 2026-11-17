@@ -1,0 +1,7 @@
+node_modules/
+config.json
+credentials.json
+captcha.*
+flow_*.json
+flow_report.txt
+*.png
