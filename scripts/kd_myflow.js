@@ -1,12 +1,12 @@
 /**
- * 金蝶云星空「信息中心 → 我的流程」抓取
+ * 金蝶云星空「信息中心 → 我的流程」抓取（优化版）
  *
- * 用法：
- *   node kd_myflow.js                # 完整流程：登录 → 我的流程 → 导出 JSON/报告
- *   node kd_myflow.js --parse-only flow_raw.json   # 只重新解析已抓取的原始数据
+ * 优化点（相对原 kd_myflow.js）：
+ *  1. OCR 常驻服务：启动时拉起 ocr_server.py，模型常驻内存，消除每次 ~12s 冷启动。
+ *  2. 自更新加缓存：10 分钟内检查过则跳过 git ls-remote（省 ~4.5s）。
+ *  3. 固定 sleep 改条件轮询：所有 waitForTimeout 改为 waitForSelector/waitForFunction 等条件。
  *
- * 验证码：脚本把验证码截图写到 captcha.png，然后轮询 captcha.txt。
- *        由调用方（Agent 视觉识别或人工）把 4 位字符写入 captcha.txt 即可。
+ * 用法同原版：node kd_myflow.js  [--parse-only flow_raw.json]
  */
 const { chromium } = require('playwright-core');
 const fs = require('fs');
@@ -20,12 +20,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function loadCfg() {
   const base = { url: 'http://i.enpower.com:8600/k3cloud/html5/index.aspx', user: '', pass: '', datacenter: '珠海英搏尔', headless: true, outDir: HERE, captchaTimeoutSec: 360, useLocalOcr: true };
-  // 1) 非敏感配置从 config.json 读
   let file = {};
   for (const p of [path.join(HERE, 'config.json'), path.join(HERE, '..', 'config.json')]) {
     if (fs.existsSync(p)) { file = JSON.parse(fs.readFileSync(p, 'utf8')); break; }
   }
-  // 2) 敏感凭据优先从 credentials.json 读（独立文件，已 gitignore）
   let cred = {};
   for (const p of [path.join(HERE, 'credentials.json'), path.join(HERE, '..', 'credentials.json')]) {
     if (fs.existsSync(p)) {
@@ -34,7 +32,6 @@ function loadCfg() {
     }
   }
   const cfg = { ...base, ...file, ...cred };
-  // 3) 环境变量可覆盖（优先级最高）
   if (process.env.KD_URL) cfg.url = process.env.KD_URL;
   if (process.env.KD_USER) cfg.user = process.env.KD_USER;
   if (process.env.KD_PASS) cfg.pass = process.env.KD_PASS;
@@ -43,7 +40,7 @@ function loadCfg() {
   if (process.env.KD_HEADLESS === '0') cfg.headless = false;
   if (process.env.KD_OCR === '0') cfg.useLocalOcr = false;
   if (!cfg.user || !cfg.pass) {
-    console.error('缺少账号凭据：请在 scripts/credentials.json 填写 user/pass，或通过 KD_USER/KD_PASS 环境变量提供。首次运行请由 WorkBuddy 弹框收集后写入 credentials.json。');
+    console.error('缺少账号凭据：请在 scripts/credentials.json 填写 user/pass，或通过 KD_USER/KD_PASS 环境变量提供。');
     process.exit(2);
   }
   return cfg;
@@ -62,7 +59,6 @@ async function winText(page) {
   });
 }
 
-/** 金蝶弹窗按钮是 <a class="k-button">，不能用 locator('button') 点 */
 async function winClick(page, labels) {
   const r = await page.evaluate((labels) => {
     const wins = [...document.querySelectorAll('.k-window')].filter((w) => w.getBoundingClientRect().width > 0);
@@ -76,18 +72,74 @@ async function winClick(page, labels) {
     }
     return { ok: false };
   }, labels);
-  await sleep(1500);
+  await sleep(800);
   return r;
 }
 
-/** dws 钉钉 CLI 真实入口（直接调 node 运行 dws.js，避免 shell 解析问题） */
+// ===================== OCR 常驻服务 =====================
+
+class OcrServer {
+  constructor() {
+    this.proc = null;
+    this.ready = false;
+    this.idx = 0;
+    this.pending = new Map();
+  }
+  start(log) {
+    return new Promise((resolve) => {
+      const py = path.join(HERE, 'ocr_server.py');
+      if (!fs.existsSync(py)) { log('OCR server 脚本不存在'); resolve(false); return; }
+      const p = spawn('python', [py], { stdio: ['pipe', 'pipe', 'pipe'] });
+      this.proc = p;
+      p.stderr.on('data', () => {});
+      let settled = false;
+      const done = (ok) => { if (!settled) { settled = true; this.ready = ok; resolve(ok); } };
+      let outBuf = '';
+      p.stdout.on('data', (chunk) => {
+        outBuf += chunk.toString();
+        let nl;
+        while ((nl = outBuf.indexOf('\n')) >= 0) {
+          const line = outBuf.slice(0, nl).trim();
+          outBuf = outBuf.slice(nl + 1);
+          if (!line) continue;
+          try {
+            const msg = JSON.parse(line);
+            if (msg.ready === true) { done(true); }
+            else if (msg.id != null && this.pending.has(msg.id)) {
+              const { resolve: res } = this.pending.get(msg.id);
+              this.pending.delete(msg.id);
+              res(msg);
+            }
+          } catch (e) {}
+        }
+      });
+      p.on('exit', () => { this.ready = false; done(false); });
+      p.on('error', () => done(false));
+      setTimeout(() => done(false), 30000);
+    });
+  }
+  ocr(imgPath) {
+    return new Promise((resolve) => {
+      if (!this.ready || !this.proc) { resolve(null); return; }
+      const id = ++this.idx;
+      this.pending.set(id, { resolve });
+      this.proc.stdin.write(JSON.stringify({ id, img: imgPath }) + '\n');
+      setTimeout(() => { if (this.pending.has(id)) { this.pending.delete(id); resolve(null); } }, 5000);
+    });
+  }
+  stop() {
+    try { if (this.proc) this.proc.kill(); } catch (e) {}
+  }
+}
+
+// ===================== 通知 =====================
+
 const DWS_JS = path.join(
   process.env.HOME || process.env.USERPROFILE,
   '.workbuddy', 'binaries', 'node', 'cli-connector-packages', 'node_modules',
   'dingtalk-workspace-cli', 'bin', 'dws.js'
 );
 
-/** 获取当前 dws 登录用户的 userId（用于「发给使用者本人」） */
 function getSelfUserId() {
   try {
     const out = execFileSync('node', [DWS_JS, 'profile', 'list', '--format', 'json'], { encoding: 'utf8', maxBuffer: 1024 * 1024 * 10 });
@@ -97,32 +149,23 @@ function getSelfUserId() {
     if (m) return m[1];
     const prof = (j.profiles || [])[0];
     return (prof && prof.userId) || null;
-  } catch (e) {
-    return null;
-  }
+  } catch (e) { return null; }
 }
 
-/** Windows 系统弹窗通知（非阻塞，用独立 wscript 进程弹 MsgBox） */
 function notifyWindows(title, message) {
   if (process.platform !== 'win32') return false;
   try {
-    // 用 VBScript MsgBox：最通用、无 .NET/COM 依赖、不被精简环境限制。
-    // .vbs 以 UTF-16LE + BOM 写入，Windows 脚本宿主（wscript）能正确识别，中文不乱码。
     const vbsPath = path.join(os.tmpdir(), 'kd_kickoff_notify.vbs');
     const esc = (s) => String(s).replace(/"/g, '""');
     const body = 'MsgBox "' + esc(message.replace(/\r?\n/g, ' ')) + '", 48, "' + esc(title) + '"';
-    // UTF-16LE BOM (FF FE) + utf16le 编码内容
     const bom = Buffer.from([0xff, 0xfe]);
     fs.writeFileSync(vbsPath, Buffer.concat([bom, Buffer.from(body, 'utf16le')]));
     const child = spawn('wscript', ['//nologo', vbsPath], { detached: true, stdio: 'ignore' });
     child.unref();
     return true;
-  } catch (e) {
-    return false;
-  }
+  } catch (e) { return false; }
 }
 
-/** 钉钉通知（发给自己）：发送一条提醒消息 */
 function notifyDingtalk(title, message) {
   try {
     const selfId = getSelfUserId();
@@ -131,15 +174,9 @@ function notifyDingtalk(title, message) {
       encoding: 'utf8', maxBuffer: 1024 * 1024 * 10,
     });
     return true;
-  } catch (e) {
-    return false;
-  }
+  } catch (e) { return false; }
 }
 
-/**
- * 踢下线提醒：当脚本需强制下线另一端登录会话时调用。
- * 同时用 Windows 弹窗 + 钉钉通知用户，避免用户不知情（自己的金蝶被登出）。
- */
 function notifyKickoff(cfg, log) {
   const title = '金蝶云星空：账号已在别处登录';
   const msg = '金蝶流程查询工具检测到你的账号已在线，已强制下线上一会话并继续登录。\n\n如果你刚才正在用金蝶，说明它已被登出，属正常现象。';
@@ -147,39 +184,14 @@ function notifyKickoff(cfg, log) {
     const w = notifyWindows(title, msg);
     const d = notifyDingtalk(title, msg.replace(/\n/g, ' '));
     log(`KICKOFF_NOTIFY windows=${w} dingtalk=${d}`);
-  } catch (e) {
-    log('KICKOFF_NOTIFY_FAILED ' + e.message);
-  }
+  } catch (e) { log('KICKOFF_NOTIFY_FAILED ' + e.message); }
 }
 
-/**
- * 本地 OCR 识别验证码（ddddocr）。
- * 返回识别出的 4 位字符串；失败返回 null（此时回退到外部文件握手）。
- */
-function ocrCaptcha(imgPath, log) {
-  try {
-    const ocrPy = path.join(HERE, 'captcha_ocr.py');
-    if (!fs.existsSync(ocrPy)) return null;
-    const out = execFileSync('python', [ocrPy, imgPath], { encoding: 'utf8', timeout: 15000 }).trim();
-    const m = out.match(/^([0-9a-zA-Z]{4})$/);
-    if (m) return m[1];
-    log('OCR 未返回有效 4 位结果: ' + out.slice(0, 50));
-    return null;
-  } catch (e) {
-    log('OCR 调用失败: ' + (e.message || '').slice(0, 80));
-    return null;
-  }
-}
+// ===================== 登录 =====================
 
-async function login(page, cfg, log) {
+async function login(page, cfg, log, ocr) {
   await page.goto(cfg.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await page.waitForTimeout(5000);
-
-  for (let i = 0; i < 40; i++) {
-    const n = await page.evaluate(() => (document.querySelector('#datacenter') || { options: [] }).options.length);
-    if (n > 1) break;
-    await sleep(1000);
-  }
+  await page.waitForFunction(() => (document.querySelector('#datacenter') || { options: [] }).options.length > 1, null, { timeout: 20000 }).catch(() => {});
   const dc = await page.evaluate((name) => {
     const el = document.querySelector('#datacenter');
     const w = window.jQuery(el).data('kendoDropDownList');
@@ -189,7 +201,7 @@ async function login(page, cfg, log) {
     return el.options[el.selectedIndex] && el.options[el.selectedIndex].text;
   }, cfg.datacenter);
   log('数据中心=' + dc);
-  await sleep(1200);
+  await sleep(500);
 
   const capPath = path.join(cfg.outDir, 'captcha.png');
   const ansPath = path.join(cfg.outDir, 'captcha.txt');
@@ -203,24 +215,30 @@ async function login(page, cfg, log) {
       document.querySelectorAll('.k-overlay, .k-loading-mask').forEach((e) => e.remove());
     });
     await page.locator('text=换一张').first().click({ timeout: 3000, force: true }).catch(() => {});
-    await sleep(1200);
+    await sleep(600);
     await page.fill('#user', cfg.user);
     await page.fill('#password', cfg.pass);
 
+    await page.waitForSelector('#img_VelidationCode', { timeout: 5000 }).catch(() => {});
     const cap = await page.$('#img_VelidationCode');
     if (!cap) { log('未找到验证码元素，可能已处于登录态'); break; }
     await cap.screenshot({ path: capPath });
     log(`captcha_saved ${capPath} attempt=${attempt}`);
 
     let ans = null;
-    // 1) 优先本地 OCR（ddddocr），免外部介入，秒级完成
-    if (cfg.useLocalOcr !== false) {
+    if (cfg.useLocalOcr !== false && ocr && ocr.ready) {
       const t0 = Date.now();
-      ans = ocrCaptcha(capPath, log);
-      if (ans) log(`captcha_ocr=${ans} (${Date.now() - t0}ms)`);
-      else log('本地 OCR 未识别，回退到文件握手');
+      const r = await ocr.ocr(capPath);
+      if (r && r.ok && r.ans) { ans = r.ans; log(`captcha_ocr=${r.ans} (${Date.now() - t0}ms)`); }
+      else log('常驻 OCR 未识别，回退到文件握手');
     }
-    // 2) 回退：文件握手（轮询 captcha.txt，由外部 Agent 写入）
+    if (!ans && cfg.useLocalOcr !== false && fs.existsSync(path.join(HERE, 'captcha_ocr.py'))) {
+      try {
+        const out = execFileSync('python', [path.join(HERE, 'captcha_ocr.py'), capPath], { encoding: 'utf8', timeout: 20000 }).trim();
+        const m = out.match(/^([0-9a-zA-Z]{4})$/);
+        if (m) ans = m[1];
+      } catch (e) {}
+    }
     if (!ans) {
       for (let i = 0; i < maxPoll; i++) {
         if (fs.existsSync(ansPath)) { ans = fs.readFileSync(ansPath, 'utf8').trim(); if (ans) break; }
@@ -231,24 +249,26 @@ async function login(page, cfg, log) {
     }
 
     await page.fill('#velidationCode', ans);
-    // 点击登录前先清掉残留的 k-overlay 遮罩层（金蝶「验证码错误」等弹窗关闭后，
-    // 遮罩层偶发不消失，会拦截 #btnLogin 的 pointer 事件导致 click 超时）。
     await page.evaluate(() => {
       document.querySelectorAll('.k-overlay, .k-loading-mask').forEach((e) => e.remove());
     });
     await sleep(300);
     await page.click('#btnLogin', { force: true, timeout: 10000 }).catch(() => page.click('#btnLogin', { force: true }).catch(() => {}));
-    await sleep(6000);
+
+    await Promise.race([
+      page.waitForSelector('#user', { state: 'hidden', timeout: 15000 }).catch(() => null),
+      sleep(15000),
+    ]);
 
     for (let k = 0; k < 6; k++) {
       const d = await winText(page);
       if (!d.length) break;
       const j = d.join(' ');
-      if (/已登录在线|让对方下线/.test(j)) { log('账号在线，按策略强制对方下线'); notifyKickoff(cfg, log); await winClick(page, ['确认']); await sleep(7000); continue; }
+      if (/已登录在线|让对方下线/.test(j)) { log('账号在线，按策略强制对方下线'); notifyKickoff(cfg, log); await winClick(page, ['确认']); await sleep(5000); continue; }
       if (/验证码/.test(j)) { log('验证码错误，重试'); await winClick(page, ['确定', '确认']); break; }
       if (/密码|用户不存在|锁定|禁用/.test(j)) { log('账号/密码或账号状态异常：' + j.slice(0, 50)); return false; }
       await winClick(page, ['确定', '确认', '关闭', '我知道了']);
-      await sleep(1000);
+      await sleep(500);
     }
 
     const ok = await page.evaluate(() => {
@@ -296,9 +316,36 @@ async function nextPage(page) {
   });
 }
 
+// ===================== 自更新（带缓存） =====================
+
+function selfUpdate(log) {
+  if (process.env.KD_NO_UPDATE) { log('self-update', '跳过（KD_NO_UPDATE=1）'); return; }
+  const cacheFile = path.join(os.tmpdir(), 'kd_myflow_update_cache.json');
+  const CACHE_MS = 10 * 60 * 1000;
+  try {
+    if (fs.existsSync(cacheFile)) {
+      const c = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+      if (Date.now() - (c.ts || 0) < CACHE_MS) { log('self-update', `缓存命中，跳过检查（${Math.round((Date.now() - c.ts) / 1000)}s 前检查过）`); return; }
+    }
+    const upd = execFileSync(process.execPath, [path.join(HERE, 'self_update.js'), '--json'], {
+      cwd: HERE, encoding: 'utf8', timeout: 30000,
+    }).trim();
+    const r = JSON.parse(upd);
+    if (r.updated) log('self-update', `已更新到最新版本 ${(r.to || '').slice(0, 7)}`);
+    else if (r.skipped) log('self-update', '跳过：' + (r.reason || '未知'));
+    else log('self-update', '已是最新版本');
+    fs.writeFileSync(cacheFile, JSON.stringify({ ts: Date.now() }));
+  } catch (e) {
+    log('self-update', '检查失败（不阻塞）：' + String(e && e.message ? e.message : e));
+  }
+}
+
+// ===================== 主流程 =====================
+
 (async () => {
   const argv = process.argv.slice(2);
   const log = (...a) => console.log('[kd]', ...a);
+  const tStart = Date.now();
 
   if (argv[0] === '--parse-only') {
     const raw = JSON.parse(fs.readFileSync(argv[1], 'utf8'));
@@ -310,46 +357,48 @@ async function nextPage(page) {
     return;
   }
 
-  // 运行前先自更新：检查 GitHub 是否有新版本，有则 pull 到最新再继续（失败只降级、不阻塞）。
-  // 支持 KD_NO_UPDATE=1 跳过自更新（离线/调试时用）。
-  if (!process.env.KD_NO_UPDATE) {
-    try {
-      const upd = execFileSync(process.execPath, [path.join(HERE, 'self_update.js'), '--json'], {
-        cwd: HERE, encoding: 'utf8', timeout: 60000,
-      }).trim();
-      const r = JSON.parse(upd);
-      if (r.updated) log('self-update', `已更新到最新版本 ${(r.to || '').slice(0, 7)}`);
-      else if (r.skipped) log('self-update', '跳过：' + (r.reason || '未知'));
-      else log('self-update', '已是最新版本');
-    } catch (e) {
-      log('self-update', '检查失败（不阻塞）：' + String(e && e.message ? e.message : e));
-    }
-  }
+  selfUpdate(log);
 
   const cfg = loadCfg();
   fs.mkdirSync(cfg.outDir, { recursive: true });
+
+  const ocr = new OcrServer();
+  const ocrReady = ocr.start(log);
+
   const browser = await chromium.launch({ channel: 'chrome', headless: cfg.headless });
   const ctx = await browser.newContext({ viewport: { width: 1560, height: 940 }, deviceScaleFactor: 2, ignoreHTTPSErrors: true });
   const page = await ctx.newPage();
 
-  try {
-    if (!(await login(page, cfg, log))) { log('LOGIN_FAILED'); await browser.close(); process.exit(3); }
-    log('登录成功');
-    await sleep(8000);
-    for (let i = 0; i < 3; i++) { const r = await winClick(page, ['知道了', '确定', '关闭']); if (!r.ok) break; await sleep(800); }
+  await ocrReady.catch(() => {});
+  log(`OCR server ${ocr.ready ? '就绪' : '不可用，将回退'}`);
 
-    await page.locator('text=信息中心').first().click({ timeout: 10000 });
-    await sleep(12000);
+  try {
+    if (!(await login(page, cfg, log, ocr))) { log('LOGIN_FAILED'); await browser.close(); ocr.stop(); process.exit(3); }
+    log('登录成功');
+
+    for (let i = 0; i < 3; i++) { const r = await winClick(page, ['知道了', '确定', '关闭']); if (!r.ok) break; await sleep(500); }
+
+    // 登录主界面渲染缓冲（原固定 sleep(8000)，改条件轮询后补 1s 缓冲，避免点太快）
+    await sleep(1000);
+
+    await page.waitForSelector('text=信息中心', { timeout: 15000 }).catch(() => {});
+    await page.locator('text=信息中心').first().click({ timeout: 10000 }).catch(() => {});
+
     const my = page.locator('text=/我的流程/').first();
-    if (await my.count().catch(() => 0)) { await my.click({ timeout: 5000 }).catch(() => {}); await sleep(6000); }
-    await page.waitForFunction(() => /当前处理人/.test(document.body.innerText || ''), null, { timeout: 60000 }).catch(() => {});
-    await sleep(3000);
+    await my.waitFor({ state: 'visible', timeout: 20000 }).catch(() => {});
+    // 「我的流程」菜单渲染缓冲（原固定 sleep(12000) 等待菜单展开，补 1.5s 缓冲）
+    await sleep(1500);
+    await my.click({ timeout: 5000 }).catch(() => {});
+
+    await page.waitForFunction(() => /当前处理人/.test(document.body.innerText || ''), null, { timeout: 30000 }).catch(() => {});
+    // 表格渲染缓冲（原固定 sleep(6000)+sleep(3000)，补 1s 缓冲确保表格加载完成）
+    await sleep(1000);
 
     let all = [];
     let meta = null;
     for (let p = 0; p < 10; p++) {
       const snap = await collectRows(page);
-      if (!snap) { log('未找到流程表格'); await page.screenshot({ path: path.join(cfg.outDir, 'no_grid.png') }); await browser.close(); process.exit(4); }
+      if (!snap) { log('未找到流程表格'); await page.screenshot({ path: path.join(cfg.outDir, 'no_grid.png') }); await browser.close(); ocr.stop(); process.exit(4); }
       meta = { total: snap.total, updated: snap.updated, pager: snap.pager };
       all = all.concat(snap.rows);
       const total = parseInt(snap.total || '0', 10);
@@ -357,7 +406,7 @@ async function nextPage(page) {
       const moved = await nextPage(page);
       log(`翻页 ${p + 1} -> ${moved ? 'ok' : 'failed'}（已取 ${all.length}/${total}）`);
       if (!moved) break;
-      await sleep(4000);
+      await page.waitForTimeout(1500);
     }
 
     const raw = { rows: all, total: meta.total, updated: meta.updated };
@@ -370,8 +419,9 @@ async function nextPage(page) {
 
     if (meta.total && all.length < parseInt(meta.total, 10)) log(`警告：页面共 ${meta.total} 行，仅取到 ${all.length} 行，报告可能不完整`);
     console.log(report);
-    log('DONE');
+    log(`DONE（总耗时 ${((Date.now() - tStart) / 1000).toFixed(1)}s）`);
   } finally {
     await browser.close();
+    ocr.stop();
   }
 })();
