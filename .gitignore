@@ -14,6 +14,7 @@ scripts/flow_*.json
 scripts/flow_report.txt
 scripts/no_grid.png
 scripts/*.png
+scripts/run_*.log
 
 # 系统文件
 .DS_Store

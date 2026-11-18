@@ -19,6 +19,17 @@ description: 登录金蝶云星空网页版（K3Cloud HTML5），进入「信息
 5. 本地 OCR（可选，推荐，用于自动识别验证码）：`python -m pip install ddddocr opencv-python numpy`（只需一次）。
    不装则回退到人工/视觉握手识别验证码。
 
+## 运行时自更新（自动，无需手动操作）
+
+每次运行 Skill（`kd_myflow.js`）或启动 MCP Server 时，都会**先检查 GitHub 远程仓库是否有新版本**，
+若有则自动 `git pull --ff-only` 拉取到最新，并在依赖清单变化时自动 `npm i`，再继续执行原任务。
+
+- 自更新由 `scripts/self_update.js` 统一实现，通过 `git ls-remote origin HEAD` 只读比对本地/远程 HEAD。
+- 仅做**快进合并**（`--ff-only`），绝不覆盖本地未提交改动；更新失败（如离线）只降级跳过，**不阻塞主流程**。
+- 跳过自更新：设环境变量 `KD_NO_UPDATE=1`（脚本方式）或运行 `self_update.js --off`。
+- 手动触发：`node scripts/self_update.js`（默认检查并更新）、`--check`（只检查）、`--json`（输出一行 JSON）。
+- MCP 额外暴露 `update_self` 工具，可随时手动检查并更新到最新。
+
 ## 凭据首次收集（关键流程）
 
 **每次运行前先检查 `scripts/credentials.json` 是否存在且含非空 `user`/`pass`。**

@@ -310,6 +310,22 @@ async function nextPage(page) {
     return;
   }
 
+  // 运行前先自更新：检查 GitHub 是否有新版本，有则 pull 到最新再继续（失败只降级、不阻塞）。
+  // 支持 KD_NO_UPDATE=1 跳过自更新（离线/调试时用）。
+  if (!process.env.KD_NO_UPDATE) {
+    try {
+      const upd = execFileSync(process.execPath, [path.join(HERE, 'self_update.js'), '--json'], {
+        cwd: HERE, encoding: 'utf8', timeout: 60000,
+      }).trim();
+      const r = JSON.parse(upd);
+      if (r.updated) log('self-update', `已更新到最新版本 ${(r.to || '').slice(0, 7)}`);
+      else if (r.skipped) log('self-update', '跳过：' + (r.reason || '未知'));
+      else log('self-update', '已是最新版本');
+    } catch (e) {
+      log('self-update', '检查失败（不阻塞）：' + String(e && e.message ? e.message : e));
+    }
+  }
+
   const cfg = loadCfg();
   fs.mkdirSync(cfg.outDir, { recursive: true });
   const browser = await chromium.launch({ channel: 'chrome', headless: cfg.headless });

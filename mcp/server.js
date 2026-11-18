@@ -34,6 +34,7 @@ const KD = path.join(SCRIPTS, 'kd_myflow.js');
 const PARSE = path.join(SCRIPTS, 'parse_flow.js');
 const NOTIFY = path.join(SCRIPTS, 'notify_dingtalk.sh');
 const NOTIFY_OVERDUE = path.join(SCRIPTS, 'notify_overdue.js');
+const SELF_UPDATE = path.join(SCRIPTS, 'self_update.js');
 const CONFIG = path.join(SCRIPTS, 'config.json');
 const CREDENTIALS = path.join(SCRIPTS, 'credentials.json');
 
@@ -115,6 +116,15 @@ const TOOLS = [
       },
     },
   },
+  {
+    name: 'update_self',
+    description:
+      '手动检查 GitHub 远程仓库是否有新版本，有则拉取到最新并重装依赖，再返回更新结果。MCP 每次启动时也会自动执行一次同样的检查。',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
 ];
 
 // ---------- 工具函数 ----------
@@ -150,6 +160,38 @@ function saveCredentials(user, pass) {
 function cfgGet(key) {
   const c = loadConfig();
   return c[key] || '';
+}
+
+/**
+ * 自更新：启动时（与手动触发 update_self 工具时）检查 GitHub 远程是否有新版本，
+ * 有则 pull 到最新并重装依赖，再继续。返回结构化结果；失败只降级、不阻塞主流程。
+ * 用 --json 让 self_update 只输出一行 JSON，避免 git 日志污染 stdio 协议。
+ */
+function selfUpdate() {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [SELF_UPDATE, '--json'], {
+      cwd: SCRIPTS,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    let err = '';
+    child.stdout.on('data', (d) => (out += d.toString()));
+    child.stderr.on('data', (d) => (err += d.toString()));
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch (e) {}
+      resolve({ updated: false, skipped: true, reason: 'self-update timeout', error: '[timeout]' });
+    }, 60000);
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      let parsed = null;
+      try { parsed = JSON.parse(out.trim()); } catch (e) {}
+      if (!parsed) {
+        parsed = { updated: false, skipped: true, reason: 'parse failed', raw: (out || err).slice(-500) };
+      }
+      parsed.exitCode = code;
+      resolve(parsed);
+    });
+  });
 }
 
 function runNode(script, args, opts = {}) {
@@ -336,6 +378,13 @@ async function toolNotifyOverdue(args) {
 
 // ---------- 启动 MCP ----------
 async function main() {
+  // 启动时先自更新到最新版本（失败只降级，不阻塞）
+  const upd = await selfUpdate();
+  if (upd.updated) {
+    // 更新后自身代码可能已变化，但 stdio 进程已在本版本内存中运行，不影响本次会话；
+    // 下次启动将使用新代码。这里仅记录，供日志排查。
+  }
+
   const server = new Server(
     { name: 'kingdee-myflow-mcp', version: '1.0.0' },
     { capabilities: { tools: {} } }
@@ -363,6 +412,10 @@ async function main() {
       }
       if (name === 'notify_overdue') {
         const result = await toolNotifyOverdue(args || {});
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+      if (name === 'update_self') {
+        const result = await selfUpdate();
         return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
       throw new McpError(ErrorCode.MethodNotFound, `未知工具: ${name}`);
